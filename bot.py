@@ -3,7 +3,7 @@ import json
 import logging
 from datetime import date, datetime
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -20,29 +20,29 @@ from google.oauth2.service_account import Credentials
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ==================== НАСТРОЙКИ — МЕНЯЙТЕ ПОД СЕБЯ ====================
+# ==================== НАСТРОЙКИ ====================
 
-# Ровно 8 категорий (можно переименовать, порядок и количество не важны)
+# Категории только для expense (для income всегда "none")
 CATEGORIES = [
-    "Продукты", "Транспорт", "Жильё", "Развлечения",
-    "Здоровье", "Одежда", "Зарплата", "Прочее",
+    "базовая еда", "техника", "одежда", "транспорт",
+    "развлечения", "жильё", "здоровье",
 ]
 
-# Счета — добавьте/уберите свои
-ACCOUNTS = ["Карта", "Наличные"]
+ACCOUNTS = ["card", "cash"]
+PAYERS = ["S", "D"]
 
-# Плательщики — добавьте/уберите свои
-PAYERS = ["Я", "Партнёр"]
+# Порядок шагов сценария (category автоматически пропускается для income)
+STEP_ORDER = ["date", "type", "amount", "category", "account", "payer", "description"]
 
-# ==================== переменные окружения (задаются в Railway) ====================
+# ==================== переменные окружения ====================
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
 GOOGLE_CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 
 # ==================== состояния диалога ====================
-(
-    DATE, DATE_CUSTOM, TYPE, AMOUNT, CATEGORY, ACCOUNT, PAYER, DESCRIPTION,
-) = range(8)
+DATE, DATE_INPUT, TYPE, AMOUNT, CATEGORY, ACCOUNT, PAYER, DESCRIPTION = range(8)
+
+BACK_BUTTON = InlineKeyboardButton("◀️ Назад", callback_data="back")
 
 
 def get_sheet():
@@ -53,47 +53,171 @@ def get_sheet():
     return client.open_by_key(SPREADSHEET_ID).sheet1
 
 
-def build_keyboard(options, prefix):
-    buttons = [[InlineKeyboardButton(o, callback_data=f"{prefix}:{o}")] for o in options]
-    return InlineKeyboardMarkup(buttons)
+def kb(pairs, prefix):
+    """pairs: список (label, value). Добавляет кнопку Назад последней строкой."""
+    rows = [[InlineKeyboardButton(label, callback_data=f"{prefix}:{value}")] for label, value in pairs]
+    rows.append([BACK_BUTTON])
+    return InlineKeyboardMarkup(rows)
+
+
+async def send_or_edit(update: Update, text: str, keyboard: InlineKeyboardMarkup):
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=keyboard)
+    else:
+        await update.message.reply_text(text, reply_markup=keyboard)
+
+
+def next_step(current, data):
+    idx = STEP_ORDER.index(current) + 1
+    while idx < len(STEP_ORDER):
+        step = STEP_ORDER[idx]
+        if step == "category" and data.get("type") == "income":
+            idx += 1
+            continue
+        return step
+    return None
+
+
+def prev_step(current, data):
+    idx = STEP_ORDER.index(current) - 1
+    while idx >= 0:
+        step = STEP_ORDER[idx]
+        if step == "category" and data.get("type") == "income":
+            idx -= 1
+            continue
+        return step
+    return None
+
+
+# ==================== рендер каждого шага ====================
+
+async def render_date(update, context):
+    context.user_data["step"] = "date"
+    keyboard = kb([("Сегодня", "today"), ("Другое", "custom")], "date")
+    await send_or_edit(update, "Укажите date:", keyboard)
+    return DATE
+
+
+async def render_type(update, context):
+    context.user_data["step"] = "type"
+    keyboard = kb([("expense", "expense"), ("income", "income")], "type")
+    await send_or_edit(update, "Укажите type:", keyboard)
+    return TYPE
+
+
+async def render_amount(update, context):
+    context.user_data["step"] = "amount"
+    keyboard = InlineKeyboardMarkup([[BACK_BUTTON]])
+    await send_or_edit(update, "Укажите amount:", keyboard)
+    return AMOUNT
+
+
+async def render_category(update, context):
+    context.user_data["step"] = "category"
+    keyboard = kb([(c, c) for c in CATEGORIES], "cat")
+    await send_or_edit(update, "Укажите category:", keyboard)
+    return CATEGORY
+
+
+async def render_account(update, context):
+    context.user_data["step"] = "account"
+    keyboard = kb([(a, a) for a in ACCOUNTS], "acc")
+    await send_or_edit(update, "Укажите account:", keyboard)
+    return ACCOUNT
+
+
+async def render_payer(update, context):
+    context.user_data["step"] = "payer"
+    keyboard = kb([(p, p) for p in PAYERS], "payer")
+    await send_or_edit(update, "Укажите payer:", keyboard)
+    return PAYER
+
+
+async def render_description(update, context):
+    context.user_data["step"] = "description"
+    keyboard = InlineKeyboardMarkup([[BACK_BUTTON]])
+    await send_or_edit(update, 'Укажите description (или "-", если не нужно):', keyboard)
+    return DESCRIPTION
+
+
+async def render_step(step, update, context):
+    return await {
+        "date": render_date,
+        "type": render_type,
+        "amount": render_amount,
+        "category": render_category,
+        "account": render_account,
+        "payer": render_payer,
+        "description": render_description,
+    }[step](update, context)
+
+
+async def goto_next(update, context, current_step):
+    nxt = next_step(current_step, context.user_data)
+    if nxt is None:
+        return await finalize(update, context)
+    return await render_step(nxt, update, context)
+
+
+# ==================== старт / завершение ====================
+
+def start_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("➕ Внести транзакцию", callback_data="new_tx")]])
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("➕ Внести транзакцию", callback_data="new_tx")]]
-    )
-    await update.message.reply_text("Привет! Что делаем?", reply_markup=keyboard)
+    await update.message.reply_text("Готово к работе.", reply_markup=start_keyboard())
 
 
 async def new_tx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     context.user_data.clear()
-    keyboard = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("Сегодня", callback_data="date:today")],
-            [InlineKeyboardButton("Другое", callback_data="date:other")],
-        ]
-    )
-    await query.edit_message_text("Выберите дату:", reply_markup=keyboard)
-    return DATE
+    return await render_date(update, context)
 
+
+async def back_to_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.callback_query.edit_message_text("Процесс завершён.", reply_markup=start_keyboard())
+    return ConversationHandler.END
+
+
+async def go_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    current = context.user_data.get("step")
+    prev = prev_step(current, context.user_data)
+    if prev is None:
+        return await back_to_start(update, context)
+    return await render_step(prev, update, context)
+
+
+async def back_from_date_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    return await render_date(update, context)
+
+
+# ==================== обработчики шагов ====================
 
 async def date_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     choice = query.data.split(":")[1]
     if choice == "today":
-        context.user_data["date"] = date.today().strftime("%d.%m.%y")
-        return await ask_type(update, context, edit=True)
-    await query.edit_message_text("Введите дату в формате дд.мм.гг (например, 05.03.25):")
-    return DATE_CUSTOM
+        context.user_data["date"] = date.today().isoformat()
+        return await goto_next(update, context, "date")
+    await query.edit_message_text(
+        "Укажите date (в формате гггг-мм-дд, например 2026-09-13):",
+        reply_markup=InlineKeyboardMarkup([[BACK_BUTTON]]),
+    )
+    return DATE_INPUT
 
 
-async def date_custom(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def date_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     parsed = None
-    for fmt in ("%d.%m.%y", "%d.%m.%Y"):
+    for fmt in ("%Y-%m-%d", "%d.%m.%y", "%d.%m.%Y"):
         try:
             parsed = datetime.strptime(text, fmt)
             break
@@ -101,34 +225,22 @@ async def date_custom(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
     if not parsed:
         await update.message.reply_text(
-            "Не получилось распознать дату. Введите в формате дд.мм.гг, например 05.03.25:"
+            "Не получилось распознать дату. Укажите date (в формате гггг-мм-дд):",
+            reply_markup=InlineKeyboardMarkup([[BACK_BUTTON]]),
         )
-        return DATE_CUSTOM
-    context.user_data["date"] = parsed.strftime("%d.%m.%y")
-    return await ask_type(update, context, edit=False)
-
-
-async def ask_type(update, context, edit: bool):
-    keyboard = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("Доход", callback_data="type:Доход")],
-            [InlineKeyboardButton("Расход", callback_data="type:Расход")],
-        ]
-    )
-    text = "Тип операции:"
-    if edit:
-        await update.callback_query.edit_message_text(text, reply_markup=keyboard)
-    else:
-        await update.message.reply_text(text, reply_markup=keyboard)
-    return TYPE
+        return DATE_INPUT
+    context.user_data["date"] = parsed.date().isoformat()
+    return await goto_next(update, context, "date")
 
 
 async def type_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    context.user_data["type"] = query.data.split(":")[1]
-    await query.edit_message_text("Введите сумму (например, 1500.50):")
-    return AMOUNT
+    value = query.data.split(":")[1]
+    context.user_data["type"] = value
+    if value == "income":
+        context.user_data["category"] = "none"
+    return await goto_next(update, context, "type")
 
 
 async def amount_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -136,73 +248,77 @@ async def amount_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         amount = float(text)
     except ValueError:
-        await update.message.reply_text("Это не похоже на число. Введите сумму ещё раз:")
+        await update.message.reply_text(
+            "Это не похоже на число. Укажите amount:",
+            reply_markup=InlineKeyboardMarkup([[BACK_BUTTON]]),
+        )
         return AMOUNT
     context.user_data["amount"] = amount
-    keyboard = build_keyboard(CATEGORIES, "cat")
-    await update.message.reply_text("Выберите категорию:", reply_markup=keyboard)
-    return CATEGORY
+    return await goto_next(update, context, "amount")
 
 
 async def category_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     context.user_data["category"] = query.data.split(":", 1)[1]
-    keyboard = build_keyboard(ACCOUNTS, "acc")
-    await query.edit_message_text("Выберите счёт:", reply_markup=keyboard)
-    return ACCOUNT
+    return await goto_next(update, context, "category")
 
 
 async def account_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     context.user_data["account"] = query.data.split(":", 1)[1]
-    keyboard = build_keyboard(PAYERS, "payer")
-    await query.edit_message_text("Кто платил?", reply_markup=keyboard)
-    return PAYER
+    return await goto_next(update, context, "account")
 
 
 async def payer_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     context.user_data["payer"] = query.data.split(":", 1)[1]
-    await query.edit_message_text('Добавьте описание (или отправьте "-", если не нужно):')
-    return DESCRIPTION
+    return await goto_next(update, context, "payer")
 
 
 async def description_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     context.user_data["description"] = "" if text == "-" else text
+    return await goto_next(update, context, "description")
 
+
+async def finalize(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = context.user_data
     row = [
-        data["date"],
-        data["type"],
-        data["amount"],
-        data["category"],
-        data["account"],
-        data["payer"],
-        data["description"],
+        data.get("date"),
+        data.get("type"),
+        data.get("amount"),
+        data.get("category", "none"),
+        data.get("account"),
+        data.get("payer"),
+        data.get("description", ""),
     ]
     try:
         sheet = get_sheet()
         sheet.append_row(row, value_input_option="USER_ENTERED")
-        await update.message.reply_text("✅ Транзакция записана в таблицу!")
+        msg = "✅ Записано."
     except Exception as e:
         logger.exception("Ошибка записи в таблицу")
-        await update.message.reply_text(f"⚠️ Не удалось записать в таблицу: {e}")
+        msg = f"⚠️ Не удалось записать в таблицу: {e}"
 
     context.user_data.clear()
-    keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("➕ Внести ещё одну", callback_data="new_tx")]]
-    )
-    await update.message.reply_text("Готово. Что дальше?", reply_markup=keyboard)
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(msg)
+        target = update.callback_query.message
+    else:
+        await update.message.reply_text(msg)
+        target = update.message
+
+    await target.reply_text("Готово к работе.", reply_markup=start_keyboard())
     return ConversationHandler.END
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("Отменено.", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text("Отменено.", reply_markup=start_keyboard())
     return ConversationHandler.END
 
 
@@ -212,14 +328,38 @@ def main():
     conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(new_tx, pattern="^new_tx$")],
         states={
-            DATE: [CallbackQueryHandler(date_choice, pattern="^date:")],
-            DATE_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, date_custom)],
-            TYPE: [CallbackQueryHandler(type_choice, pattern="^type:")],
-            AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, amount_input)],
-            CATEGORY: [CallbackQueryHandler(category_choice, pattern="^cat:")],
-            ACCOUNT: [CallbackQueryHandler(account_choice, pattern="^acc:")],
-            PAYER: [CallbackQueryHandler(payer_choice, pattern="^payer:")],
-            DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, description_input)],
+            DATE: [
+                CallbackQueryHandler(date_choice, pattern="^date:"),
+                CallbackQueryHandler(go_back, pattern="^back$"),
+            ],
+            DATE_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, date_input_handler),
+                CallbackQueryHandler(back_from_date_input, pattern="^back$"),
+            ],
+            TYPE: [
+                CallbackQueryHandler(type_choice, pattern="^type:"),
+                CallbackQueryHandler(go_back, pattern="^back$"),
+            ],
+            AMOUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, amount_input),
+                CallbackQueryHandler(go_back, pattern="^back$"),
+            ],
+            CATEGORY: [
+                CallbackQueryHandler(category_choice, pattern="^cat:"),
+                CallbackQueryHandler(go_back, pattern="^back$"),
+            ],
+            ACCOUNT: [
+                CallbackQueryHandler(account_choice, pattern="^acc:"),
+                CallbackQueryHandler(go_back, pattern="^back$"),
+            ],
+            PAYER: [
+                CallbackQueryHandler(payer_choice, pattern="^payer:"),
+                CallbackQueryHandler(go_back, pattern="^back$"),
+            ],
+            DESCRIPTION: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, description_input),
+                CallbackQueryHandler(go_back, pattern="^back$"),
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
